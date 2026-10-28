@@ -9,6 +9,7 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -64,7 +65,11 @@ class DocuBot:
         ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for filename, text in documents:
+            for token in re.findall(r"[a-z0-9_]+", text.lower()):
+                files = index.setdefault(token, [])
+                if filename not in files:
+                    files.append(filename)
         return index
 
     # -----------------------------------------------------------
@@ -81,8 +86,9 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        query_words = set(re.findall(r"[a-z0-9_]+", query.lower()))
+        text_words = set(re.findall(r"[a-z0-9_]+", text.lower()))
+        return len(query_words & text_words)
 
     def retrieve(self, query, top_k=3):
         """
@@ -91,9 +97,20 @@ class DocuBot:
 
         Return a list of (filename, text) sorted by score descending.
         """
-        results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        texts = dict(self.documents)
+
+        candidates = set()
+        for word in re.findall(r"[a-z0-9_]+", query.lower()):
+            candidates.update(self.index.get(word, []))
+
+        scored = []
+        for filename in candidates:
+            score = self.score_document(query, texts[filename])
+            if score > 0:
+                scored.append((score, filename))
+
+        scored.sort(key=lambda pair: (-pair[0], pair[1]))
+        return [(filename, texts[filename]) for _, filename in scored[:top_k]]
 
     # -----------------------------------------------------------
     # Answering Modes
