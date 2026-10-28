@@ -12,6 +12,44 @@ import glob
 import re
 
 class DocuBot:
+    # Guardrail: the best chunk must match at least this many distinct query
+    # words, otherwise we treat the docs as having no useful evidence.
+    MIN_MATCHING_WORDS = 2
+
+    # Common filler words that say nothing about relevance; ignored everywhere.
+    STOP_WORDS = {
+        "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does",
+        "for", "from", "how", "i", "if", "in", "is", "it", "me", "my", "of",
+        "on", "or", "so", "that", "the", "this", "to", "was", "we", "what",
+        "when", "where", "which", "who", "why", "will", "with", "you", "your",
+    }
+
+    # Endings trimmed by stem(); longer ones first so "es" wins over "s".
+    SUFFIXES = ("ions", "ion", "ings", "ing", "ed", "es", "s")
+
+    def stem(self, word):
+        """
+        Crude stemmer so word forms match: "authenticate", "authenticates"
+        and "authentication" all become "authenticat".
+        """
+        for suffix in self.SUFFIXES:
+            if word.endswith(suffix) and not word.endswith("ss") \
+                    and len(word) - len(suffix) >= 3:
+                word = word[:-len(suffix)]
+                break
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+    def tokenize(self, text):
+        """
+        Lowercase words in text with punctuation and stop words removed.
+        Underscores split words ("generate_access_token" -> three words)
+        and each word is stemmed.
+        """
+        words = re.findall(r"[a-z0-9]+", text.lower())
+        return [self.stem(w) for w in words if w not in self.STOP_WORDS]
+
     def __init__(self, docs_folder="docs", llm_client=None):
         """
         docs_folder: directory containing project documentation files
@@ -23,8 +61,11 @@ class DocuBot:
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
 
+        # Split documents into paragraph chunks: list of (filename, chunk)
+        self.chunks = self.split_into_chunks(self.documents)
+
         # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        self.index = self.build_index(self.chunks)
 
     # -----------------------------------------------------------
     # Document Loading
@@ -45,31 +86,40 @@ class DocuBot:
                 docs.append((filename, text))
         return docs
 
+    def split_into_chunks(self, documents):
+        """
+        Splits each document into paragraphs separated by blank lines.
+        Returns a list of tuples: (filename, paragraph)
+        """
+        chunks = []
+        for filename, text in documents:
+            for paragraph in re.split(r"\n\s*\n", text):
+                paragraph = paragraph.strip()
+                if paragraph:
+                    chunks.append((filename, paragraph))
+        return chunks
+
     # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
-    def build_index(self, documents):
+    def build_index(self, chunks):
         """
-        TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Build a tiny inverted index mapping lowercase words to the chunks
+        they appear in. Chunks are identified by their position in `chunks`.
 
         Example structure:
         {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
+            "token": [0, 7],
+            "database": [12]
         }
-
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
         """
         index = {}
-        for filename, text in documents:
-            for token in re.findall(r"[a-z0-9_]+", text.lower()):
-                files = index.setdefault(token, [])
-                if filename not in files:
-                    files.append(filename)
+        for chunk_id, (_, text) in enumerate(chunks):
+            for token in self.tokenize(text):
+                ids = index.setdefault(token, [])
+                if chunk_id not in ids:
+                    ids.append(chunk_id)
         return index
 
     # -----------------------------------------------------------
@@ -86,8 +136,8 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        query_words = set(re.findall(r"[a-z0-9_]+", query.lower()))
-        text_words = set(re.findall(r"[a-z0-9_]+", text.lower()))
+        query_words = set(self.tokenize(query))
+        text_words = set(self.tokenize(text))
         return len(query_words & text_words)
 
     def retrieve(self, query, top_k=3):
@@ -97,20 +147,27 @@ class DocuBot:
 
         Return a list of (filename, text) sorted by score descending.
         """
-        texts = dict(self.documents)
+        query_words = set(self.tokenize(query))
 
         candidates = set()
-        for word in re.findall(r"[a-z0-9_]+", query.lower()):
+        for word in query_words:
             candidates.update(self.index.get(word, []))
 
         scored = []
-        for filename in candidates:
-            score = self.score_document(query, texts[filename])
+        for chunk_id in candidates:
+            score = self.score_document(query, self.chunks[chunk_id][1])
             if score > 0:
-                scored.append((score, filename))
+                scored.append((score, chunk_id))
 
         scored.sort(key=lambda pair: (-pair[0], pair[1]))
-        return [(filename, texts[filename]) for _, filename in scored[:top_k]]
+
+        # Refuse when there is no meaningful evidence: nothing matched, or even
+        # the best chunk matches too few of the query's words.
+        required = min(self.MIN_MATCHING_WORDS, len(query_words))
+        if not scored or scored[0][0] < required:
+            return []
+
+        return [self.chunks[chunk_id] for _, chunk_id in scored[:top_k]]
 
     # -----------------------------------------------------------
     # Answering Modes
